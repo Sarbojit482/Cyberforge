@@ -1,0 +1,93 @@
+package cyberforge.evidence;
+
+import cyberforge.analysis.Finding;
+import cyberforge.util.Json;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Normalizes findings from SAST/DAST/fuzzing/testing into a single common
+ * JSON evidence format (per the project spec: "All findings from SAST, DAST,
+ * fuzzing and testing should be normalized into a common evidence format")
+ * and persists it to disk for the future Cyber Reasoning Agent to consume.
+ *
+ * SECURITY:
+ *  - Evidence files can describe real, exploitable vulnerabilities in a real
+ *    codebase. They are written with restrictive, owner-only permissions
+ *    (directory 700 / file 600) wherever the filesystem supports POSIX
+ *    permissions, instead of inheriting default/world-readable permissions —
+ *    a vulnerability report is itself sensitive data.
+ *  - The evidence directory and filename are both derived from a fixed base
+ *    path and a timestamp CyberForge generates itself — never taken from
+ *    operator input — so there is no path-injection surface in this class.
+ */
+public final class EvidenceManager {
+
+    private final Path evidenceDir;
+
+    public EvidenceManager(Path evidenceDir) {
+        this.evidenceDir = evidenceDir;
+    }
+
+    public Path writeEvidence(String targetPath, String primaryLanguage, int fileCount,
+                               List<Finding> findings, boolean analysisSucceeded,
+                               String analysisError) throws IOException {
+        Files.createDirectories(evidenceDir);
+        restrictPermissions(evidenceDir, "rwx------");
+
+        String timestamp = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(LocalDateTime.now());
+        Path file = evidenceDir.resolve("evidence-" + timestamp + ".json");
+
+        Map<String, Object> root = new LinkedHashMap<>();
+        root.put("schema_version", "1.0");
+        root.put("generated_at", Instant.now().toString());
+        root.put("target_path", targetPath);
+        root.put("primary_language", primaryLanguage);
+        root.put("file_count", fileCount);
+        root.put("static_analysis_succeeded", analysisSucceeded);
+        if (!analysisSucceeded) {
+            root.put("static_analysis_error", analysisError);
+        }
+        root.put("static_findings", toFindingsJson(findings));
+
+        Files.writeString(file, Json.write(root, true));
+        restrictPermissions(file, "rw-------");
+        return file;
+    }
+
+    private List<Object> toFindingsJson(List<Finding> findings) {
+        List<Object> out = new ArrayList<>();
+        for (Finding f : findings) {
+            Map<String, Object> fj = new LinkedHashMap<>();
+            fj.put("rule_id", f.ruleId());
+            fj.put("file", f.filePath());
+            fj.put("start_line", f.startLine());
+            fj.put("end_line", f.endLine());
+            fj.put("severity", f.severity());
+            fj.put("message", f.message());
+            fj.put("snippet", f.snippet());
+            out.add(fj);
+        }
+        return out;
+    }
+
+    private void restrictPermissions(Path path, String posixMode) {
+        try {
+            Files.setPosixFilePermissions(path, PosixFilePermissions.fromString(posixMode));
+        } catch (UnsupportedOperationException | IOException ignored) {
+            // Non-POSIX filesystem (e.g. some Windows configurations) — best effort only,
+            // and not fatal: the evidence is still written, just without the extra
+            // permission hardening on platforms that don't support it.
+        }
+    }
+}
